@@ -2436,10 +2436,16 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 // createUploadSession creates an upload session for the object
 func (o *Object) createUploadSession(ctx context.Context, src fs.ObjectInfo, modTime time.Time) (response *api.CreateUploadResponse, metadata fs.Metadata, err error) {
 	opts := o.fs.newOptsCallWithPath(ctx, o.remote, "POST", "/createUploadSession")
-	createRequest, metadata, err := o.fetchMetadataForCreate(ctx, src, opts.Options, modTime)
-	if err != nil {
-		return nil, metadata, err
+
+	// Create a simple upload session request with just conflict behavior
+	// More complex metadata will be set after upload completes
+	// Using a map because the API types don't properly support @microsoft.graph.conflictBehavior
+	createRequest := map[string]interface{}{
+		"item": map[string]interface{}{
+			"@microsoft.graph.conflictBehavior": "replace",
+		},
 	}
+
 	var resp *http.Response
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, &createRequest, &response)
@@ -2451,6 +2457,18 @@ func (o *Object) createUploadSession(ctx context.Context, src fs.ObjectInfo, mod
 		}
 		return shouldRetry(ctx, resp, err)
 	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Get metadata for later setting after upload completes
+	metadata, err = fs.GetMetadataOptions(ctx, o.fs, src, opts.Options)
+	if err != nil {
+		fs.Debugf(o, "Failed to read metadata from source object (will set basic mtime only): %v", err)
+		metadata = nil
+		err = nil
+	}
+
 	return response, metadata, err
 }
 
@@ -2487,46 +2505,19 @@ func (o *Object) getPosition(ctx context.Context, url string) (pos int64, err er
 
 // uploadFragment uploads a part
 func (o *Object) uploadFragment(ctx context.Context, url string, start int64, totalSize int64, chunk io.ReadSeeker, chunkSize int64, options ...fs.OpenOption) (info *api.Item, err error) {
-	//	var response api.UploadFragmentResponse
 	var resp *http.Response
 	var body []byte
-	skip := int64(0)
 	err = o.fs.pacer.Call(func() (bool, error) {
-		toSend := chunkSize - skip
 		opts := rest.Opts{
 			Method:        "PUT",
 			RootURL:       url,
-			ContentLength: &toSend,
-			ContentRange:  fmt.Sprintf("bytes %d-%d/%d", start+skip, start+chunkSize-1, totalSize),
+			ContentLength: &chunkSize,
+			ContentRange:  fmt.Sprintf("bytes %d-%d/%d", start, start+chunkSize-1, totalSize),
 			Body:          chunk,
 			Options:       options,
 		}
-		_, _ = chunk.Seek(skip, io.SeekStart)
+		_, _ = chunk.Seek(0, io.SeekStart)
 		resp, err = o.fs.unAuth.Call(ctx, &opts)
-		if err != nil && resp != nil && resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
-			fs.Debugf(o, "Received 416 error - reading current position from server: %v", err)
-			pos, posErr := o.getPosition(ctx, url)
-			if posErr != nil {
-				fs.Debugf(o, "Failed to read position: %v", posErr)
-				return false, posErr
-			}
-			skip = pos - start
-			fs.Debugf(o, "Read position %d, chunk is %d..%d, bytes to skip = %d", pos, start, start+chunkSize, skip)
-			switch {
-			case skip < 0:
-				return false, fmt.Errorf("sent block already (skip %d < 0), can't rewind: %w", skip, err)
-			case skip > chunkSize:
-				return false, fmt.Errorf("position is in the future (skip %d > chunkSize %d), can't skip forward: %w", skip, chunkSize, err)
-			case skip == chunkSize:
-				fs.Debugf(o, "Skipping chunk as already sent (skip %d == chunkSize %d)", skip, chunkSize)
-				return false, nil
-			}
-			return true, fmt.Errorf("retry this chunk skipping %d bytes: %w", skip, err)
-		} else if err != nil && resp != nil && resp.StatusCode == http.StatusNotFound {
-			fs.Debugf(o, "Received 404 error: assuming eventual consistency problem with session - retrying chunk: %v", err)
-			time.Sleep(5 * time.Second) // a little delay to help things along
-			return true, err
-		}
 		if err != nil {
 			return shouldRetry(ctx, resp, err)
 		}
@@ -2534,13 +2525,17 @@ func (o *Object) uploadFragment(ctx context.Context, url string, start int64, to
 		if err != nil {
 			return shouldRetry(ctx, resp, err)
 		}
-		if resp.StatusCode == 200 || resp.StatusCode == 201 {
-			// we are done :)
-			// read the item
-			info = &api.Item{}
-			return false, json.Unmarshal(body, info)
+		// Accept 202 Accepted (more chunks expected), 201 Created (final chunk), or 200 OK
+		if resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
+			if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
+				// we are done :)
+				// read the item
+				info = &api.Item{}
+				return false, json.Unmarshal(body, info)
+			}
+			return false, nil
 		}
-		return false, nil
+		return shouldRetry(ctx, resp, fmt.Errorf("unexpected status code: %d - %s", resp.StatusCode, string(body)))
 	})
 	return info, err
 }
@@ -2571,7 +2566,7 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, src fs.Objec
 
 	// Create upload session
 	fs.Debugf(o, "Starting multipart upload")
-	session, metadata, err := o.createUploadSession(ctx, src, modTime)
+	session, _, err := o.createUploadSession(ctx, src, modTime)
 	if err != nil {
 		return nil, err
 	}
@@ -2601,18 +2596,29 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, src fs.Objec
 		position += n
 	}
 
-	err = o.setMetaData(info)
-	if err != nil {
-		return info, err
-	}
-	if metadata == nil || !o.fs.needsUpdatePermissions(metadata) {
-		return info, err
-	}
-	info, err = o.updateMetadata(ctx, metadata) // for permissions, which can't be set during original upload
-	if info == nil {
-		return nil, err
-	}
-	return info, o.setMetaData(info)
+	// err = o.setMetaData(info)
+	// if err != nil {
+	// 	return info, err
+	// }
+
+	// Set the mod time now and read metadata (similar to uploadSinglepart)
+	// info, err = o.fs.fetchAndUpdateMetadata(ctx, src, options, o)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("failed to fetch and update metadata: %w", err)
+	// }
+	// if info != nil {
+	// 	err = o.setMetaData(info)
+	// }
+
+	// Remove versions if required (setting modtime creates a new version on OneDrive Business)
+	/*if o.fs.opt.NoVersions {
+		err := o.deleteVersions(ctx)
+		if err != nil {
+			fs.Errorf(o, "Failed to remove versions: %v", err)
+		}
+	}*/
+
+	return info, err
 }
 
 // Update the content of a remote file within 4 MiB size in one single request
